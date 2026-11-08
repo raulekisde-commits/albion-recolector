@@ -194,11 +194,35 @@ def price_rows(data, fetched_at):
     return rows
 
 
+# Black Market: se suman estas calidades (Normal a Excellent) por día.
+BM_LOCATION = "Black Market"
+BM_QUALITIES = (1, 2, 3, 4)
+
+
 def history_rows(data, since):
     rows = {}
+    bm_days = {}
     for row in data:
-        # El endpoint devuelve todas las calidades; se usa solo calidad 1.
-        if row.get("quality", 1) != 1:
+        quality = row.get("quality", 1)
+        # Black Market: sumar calidades 1-4 (unidades y silver) por día.
+        if row.get("location") == BM_LOCATION:
+            if quality not in BM_QUALITIES:
+                continue
+            for point in row.get("data", []):
+                try:
+                    day = datetime.fromisoformat(point["timestamp"].replace("Z", "")).date()
+                except Exception:
+                    continue
+                count = int(point.get("item_count") or 0)
+                price = point.get("avg_price") or 0
+                if day < since or count <= 0 or price <= 0:
+                    continue
+                acc = bm_days.setdefault((row["item_id"], day), [0, 0.0])
+                acc[0] += count
+                acc[1] += count * price
+            continue
+        # Ciudades: solo calidad 1.
+        if quality != 1:
             continue
         for point in row.get("data", []):
             try:
@@ -218,6 +242,14 @@ def history_rows(data, since):
                 "avg_price": price,
                 "item_count": int(point.get("item_count") or 0),
             }
+    for (item_id, day), (count, silver) in bm_days.items():
+        rows[(item_id, BM_LOCATION, day)] = {
+            "item_id": item_id,
+            "city": BM_LOCATION,
+            "day": day.isoformat(),
+            "avg_price": round(silver / count),
+            "item_count": count,
+        }
     return list(rows.values())
 
 
