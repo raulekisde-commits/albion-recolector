@@ -1,0 +1,28 @@
+name: Recolector de precios
+
+on:
+  schedule:
+    # Cada 2 horas, en el minuto 17 (UTC). GitHub puede demorar unos minutos.
+    - cron: "17 */2 * * *"
+  workflow_dispatch:   # botón "Run workflow" para correrlo a mano
+
+concurrency:
+  group: recolector
+  cancel-in-progress: false
+
+jobs:
+  recolectar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Bajar precios de AODP y guardarlos en Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python collector.py
