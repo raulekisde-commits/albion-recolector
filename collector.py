@@ -181,10 +181,11 @@ def to_ts(value):
     return value if value.endswith("Z") or "+" in value[10:] else value + "Z"
 
 
-def price_rows(data, fetched_at, server="west"):
+def price_rows(data, fetched_at, server="west", qset=frozenset()):
     rows = []
     for row in data:
-        if row.get("quality", 1) != 1:
+        quality = int(row.get("quality", 1) or 1)
+        if quality != 1 and not (row.get("city") != BM_LOCATION and row["item_id"] in qset and 2 <= quality <= 5):
             continue
         smin = int(row.get("sell_price_min") or 0)
         bmax = int(row.get("buy_price_max") or 0)
@@ -194,7 +195,7 @@ def price_rows(data, fetched_at, server="west"):
             "server": server,
             "item_id": row["item_id"],
             "city": row["city"],
-            "quality": 1,
+            "quality": quality,
             "source": SOURCE,
             "sell_min": smin,
             "sell_max": int(row.get("sell_price_max") or 0),
@@ -207,12 +208,31 @@ def price_rows(data, fetched_at, server="west"):
 
 
 # Black Market: se guardan las calidades 1-4 por separado (Masterpiece afuera);
-# las vistas las suman por día. Ciudades: solo calidad 1.
+# las vistas las suman por día. Ciudades: calidad 1 para todo y, desde la v3,
+# calidades 2-5 solo para equipo (armas, armaduras, capas, bolsos), que es lo
+# único que tiene calidad. No hay más llamadas a AODP: el historial ya trae
+# todas las calidades en la misma respuesta y los precios aceptan varias
+# calidades en el mismo pedido. Las filas 2-5 se guardan pocos días
+# (app_config.quality_history_days, 9 por defecto) para no inflar la base.
+import re as _re
+EQUIP_RE = _re.compile(r"^T\d+_(MAIN|2H|OFF|HEAD|ARMOR|SHOES|CAPE|BAG)(_|$)")
+
+
+def quality_ids(ids, config):
+    """IDs que llevan calidades 2-5. quality_mode: 'equipment' (todo el equipo seguido, por defecto),
+    'list' (solo app_config.quality_item_ids: el cofre y lo que se craftea) u 'off'."""
+    mode = str(config.get("quality_mode") or "equipment").strip('"').lower()
+    if mode == "off":
+        return set()
+    if mode == "list":
+        wanted = set(config.get("quality_item_ids") or [])
+        return {i for i in ids if i in wanted}
+    return {i for i in ids if EQUIP_RE.match(i) and "ARTEFACT" not in i}
 BM_LOCATION = "Black Market"
 BM_QUALITIES = (1, 2, 3, 4)
 
 
-def history_rows(data, since, server="west"):
+def history_rows(data, since, server="west", qset=frozenset(), qsince=None):
     rows = {}
     for row in data:
         quality = int(row.get("quality", 1) or 1)
@@ -220,14 +240,15 @@ def history_rows(data, since, server="west"):
         if location == BM_LOCATION:
             if quality not in BM_QUALITIES:
                 continue
-        elif quality != 1:
+        elif quality != 1 and not (row["item_id"] in qset and 2 <= quality <= 5):
             continue
+        q_since = qsince if (location != BM_LOCATION and quality >= 2 and qsince) else since
         for point in row.get("data", []):
             try:
                 day = datetime.fromisoformat(point["timestamp"].replace("Z", "")).date()
             except Exception:
                 continue
-            if day < since:
+            if day < max(since, q_since):
                 continue
             price = int(round(point.get("avg_price") or 0))
             count = int(point.get("item_count") or 0)
@@ -287,7 +308,7 @@ def main():
     failed = []
     for server in servers:
         try:
-            collect(db, ids, server, AODP_HOSTS[server], retention, dry_run)
+            collect(db, ids, server, AODP_HOSTS[server], retention, dry_run, config)
         except Exception as exc:
             log(f"ERROR en {server}: {exc}")
             failed.append(server)
@@ -295,7 +316,10 @@ def main():
         raise SystemExit(f"Fallaron: {', '.join(failed)}")
 
 
-def collect(db, ids, server, host, retention, dry_run):
+def collect(db, ids, server, host, retention, dry_run, config=None):
+    config = config or {}
+    qset = quality_ids(ids, config)
+    qdays = int(os.environ.get("QUALITY_HISTORY_DAYS") or config.get("quality_history_days") or 9)
     log(f"=== Servidor {server} ({host}) ===")
     run = None
     if not dry_run:
@@ -318,26 +342,33 @@ def collect(db, ids, server, host, retention, dry_run):
             or not db.has_rows("market_history", {"server": f"eq.{server}"})
         )
         upsert_since = since if full else date.today() - timedelta(days=3)
+        qsince = date.today() - timedelta(days=qdays)
         log("Historial: " + ("completo" if full else "últimos 3 días"))
+        log(f"Calidades 2-5: {len(qset)} ítems de equipo · se guardan {qdays} días")
         prices, history = [], []
         batches = range(0, len(ids), AODP_BATCH)
 
         log("Bajando precios actuales...")
-        for i, n in enumerate(batches):
-            batch = ids[n:n + AODP_BATCH]
-            data = aodp_get(session, f"{host}/prices/{','.join(batch)}.json",
-                            {"locations": ",".join(LOCATIONS), "qualities": 1})
-            prices.extend(price_rows(data, fetched_at, server))
-            if i % 10 == 0:
-                log(f"  {min(n + AODP_BATCH, len(ids))}/{len(ids)}")
-            time.sleep(AODP_PAUSE)
+        # mismo número de pedidos que antes: el equipo pide las 5 calidades en el mismo pedido
+        groups = [(sorted(qset), "1,2,3,4,5"), ([i for i in ids if i not in qset], "1")]
+        done = 0
+        for gids, quals in groups:
+            for i in range(0, len(gids), AODP_BATCH):
+                batch = gids[i:i + AODP_BATCH]
+                data = aodp_get(session, f"{host}/prices/{','.join(batch)}.json",
+                                {"locations": ",".join(LOCATIONS), "qualities": quals})
+                prices.extend(price_rows(data, fetched_at, server, qset))
+                done += len(batch)
+                if (i // AODP_BATCH) % 10 == 0:
+                    log(f"  {done}/{len(ids)}")
+                time.sleep(AODP_PAUSE)
 
         log("Bajando historial diario...")
         for i, n in enumerate(batches):
             batch = ids[n:n + AODP_BATCH]
             data = aodp_get(session, f"{host}/history/{','.join(batch)}.json",
                             {"locations": ",".join(LOCATIONS), "time-scale": 24})
-            history.extend(history_rows(data, upsert_since, server))
+            history.extend(history_rows(data, upsert_since, server, qset, qsince))
             if i % 10 == 0:
                 log(f"  {min(n + AODP_BATCH, len(ids))}/{len(ids)}")
             time.sleep(AODP_PAUSE)
@@ -351,6 +382,11 @@ def collect(db, ids, server, host, retention, dry_run):
         db.upsert("market_prices", prices, "server,item_id,city,quality")
         db.upsert("market_history", history, "server,item_id,city,quality,day")
         db.delete("market_history", {"server": f"eq.{server}", "day": f"lt.{since.isoformat()}"})
+        # calidades 2-5: retención corta (alcanza para el promedio de 7 días completos)
+        db.delete("market_history", {"server": f"eq.{server}", "quality": "gte.2",
+                                     "city": f"neq.{BM_LOCATION}", "day": f"lt.{qsince.isoformat()}"})
+        db.delete("market_prices", {"server": f"eq.{server}", "quality": "gte.2", "city": f"neq.{BM_LOCATION}",
+                                    "fetched_at": f"lt.{(datetime.now(timezone.utc) - timedelta(days=qdays)).isoformat()}"})
 
         db.update("collector_runs", {"id": run["id"]}, {
             "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -374,4 +410,3 @@ def collect(db, ids, server, host, retention, dry_run):
 
 if __name__ == "__main__":
     main()
-
