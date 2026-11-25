@@ -374,3 +374,4 @@ def collect(db, ids, server, host, retention, dry_run):
 
 if __name__ == "__main__":
     main()
+
