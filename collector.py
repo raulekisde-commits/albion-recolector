@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Recolector de precios de Albion Online (NA / West) → Supabase.
+Recolector de precios de Albion Online → Supabase (v2: servidores, calidad, fuente).
 
 Baja de Albion Online Data Project (AODP) los precios actuales y el
 historial diario de todos los ítems activos en `tracked_items` y los guarda
@@ -15,8 +15,12 @@ a mano:
 Variables de entorno (o archivo .env en esta carpeta o en la de arriba):
     SUPABASE_URL           https://xxxx.supabase.co
     SUPABASE_SERVICE_KEY   clave secreta (service_role / sb_secret_...)
-    AODP_HOST              opcional, por defecto el servidor West
-    HISTORY_RETENTION_DAYS opcional, por defecto 30
+    AODP_SERVERS           opcional: west,europe,east (por defecto lo que diga app_config.servers, o west)
+    HISTORY_RETENTION_DAYS opcional, por defecto app_config.history_retention_days o 30
+
+v2: cada fila guarda servidor, calidad y fuente. El Black Market se guarda por calidad
+(1-4) y se suma recién en las vistas; las ciudades guardan calidad 1. Requiere haber
+corrido migracion_precios_v2.sql.
 """
 
 import os
@@ -26,7 +30,12 @@ from datetime import date, datetime, timedelta, timezone
 
 import requests
 
-AODP_HOST = "https://west.albion-online-data.com/api/v2/stats"
+AODP_HOSTS = {
+    "west": "https://west.albion-online-data.com/api/v2/stats",
+    "europe": "https://europe.albion-online-data.com/api/v2/stats",
+    "east": "https://east.albion-online-data.com/api/v2/stats",
+}
+SOURCE = "aodp"
 LOCATIONS = [
     "Thetford", "Lymhurst", "Martlock", "Fort Sterling", "Bridgewatch",
     "Caerleon", "Brecilien", "Black Market",
@@ -34,7 +43,7 @@ LOCATIONS = [
 AODP_BATCH = 100          # IDs por request a AODP
 AODP_PAUSE = 1.1          # segundos entre requests (límite AODP: 300 cada 5 min)
 UPSERT_CHUNK = 1000       # filas por request a Supabase
-USER_AGENT = "smogg-wujucraft-collector/1.0"
+USER_AGENT = "smogg-wujucraft-collector/2.0"
 
 
 def log(msg):
@@ -90,9 +99,9 @@ class Supabase:
                 return rows
             offset += page
 
-    def has_rows(self, table):
+    def has_rows(self, table, filters=None):
         response = self._check(self.session.get(
-            f"{self.base}/{table}", params={"select": "*", "limit": 1}
+            f"{self.base}/{table}", params=dict(filters or {}, select="*", limit=1)
         ))
         return bool(response.json())
 
@@ -172,7 +181,7 @@ def to_ts(value):
     return value if value.endswith("Z") or "+" in value[10:] else value + "Z"
 
 
-def price_rows(data, fetched_at):
+def price_rows(data, fetched_at, server="west"):
     rows = []
     for row in data:
         if row.get("quality", 1) != 1:
@@ -182,8 +191,11 @@ def price_rows(data, fetched_at):
         if smin <= 0 and bmax <= 0:
             continue
         rows.append({
+            "server": server,
             "item_id": row["item_id"],
             "city": row["city"],
+            "quality": 1,
+            "source": SOURCE,
             "sell_min": smin,
             "sell_max": int(row.get("sell_price_max") or 0),
             "buy_max": bmax,
@@ -194,35 +206,21 @@ def price_rows(data, fetched_at):
     return rows
 
 
-# Black Market: se suman estas calidades (Normal a Excellent) por día.
+# Black Market: se guardan las calidades 1-4 por separado (Masterpiece afuera);
+# las vistas las suman por día. Ciudades: solo calidad 1.
 BM_LOCATION = "Black Market"
 BM_QUALITIES = (1, 2, 3, 4)
 
 
-def history_rows(data, since):
+def history_rows(data, since, server="west"):
     rows = {}
-    bm_days = {}
     for row in data:
-        quality = row.get("quality", 1)
-        # Black Market: sumar calidades 1-4 (unidades y silver) por día.
-        if row.get("location") == BM_LOCATION:
+        quality = int(row.get("quality", 1) or 1)
+        location = row.get("location")
+        if location == BM_LOCATION:
             if quality not in BM_QUALITIES:
                 continue
-            for point in row.get("data", []):
-                try:
-                    day = datetime.fromisoformat(point["timestamp"].replace("Z", "")).date()
-                except Exception:
-                    continue
-                count = int(point.get("item_count") or 0)
-                price = point.get("avg_price") or 0
-                if day < since or count <= 0 or price <= 0:
-                    continue
-                acc = bm_days.setdefault((row["item_id"], day), [0, 0.0])
-                acc[0] += count
-                acc[1] += count * price
-            continue
-        # Ciudades: solo calidad 1.
-        if quality != 1:
+        elif quality != 1:
             continue
         for point in row.get("data", []):
             try:
@@ -231,26 +229,32 @@ def history_rows(data, since):
                 continue
             if day < since:
                 continue
-            price = int(point.get("avg_price") or 0)
+            price = int(round(point.get("avg_price") or 0))
+            count = int(point.get("item_count") or 0)
             if price <= 0:
                 continue
-            key = (row["item_id"], row["location"], day)
+            if location == BM_LOCATION and count <= 0:
+                continue
+            key = (row["item_id"], location, quality, day)
             rows[key] = {
+                "server": server,
                 "item_id": row["item_id"],
-                "city": row["location"],
+                "city": location,
+                "quality": quality,
                 "day": day.isoformat(),
                 "avg_price": price,
-                "item_count": int(point.get("item_count") or 0),
+                "item_count": count,
+                "source": SOURCE,
             }
-    for (item_id, day), (count, silver) in bm_days.items():
-        rows[(item_id, BM_LOCATION, day)] = {
-            "item_id": item_id,
-            "city": BM_LOCATION,
-            "day": day.isoformat(),
-            "avg_price": round(silver / count),
-            "item_count": count,
-        }
     return list(rows.values())
+
+
+def read_config(db):
+    """app_config como dict (vacío si la tabla no existe)."""
+    try:
+        return {r["key"]: r["value"] for r in db.select_all("app_config", {"select": "key,value"})}
+    except Exception:
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -267,10 +271,11 @@ def main():
     key = os.environ.get("SUPABASE_SERVICE_KEY")
     if not url or not key:
         raise SystemExit("Faltan SUPABASE_URL y/o SUPABASE_SERVICE_KEY.")
-    host = os.environ.get("AODP_HOST", AODP_HOST).rstrip("/")
-    retention = int(os.environ.get("HISTORY_RETENTION_DAYS", "30"))
-
     db = Supabase(url, key)
+    config = read_config(db)
+    servers = [s.strip().lower() for s in (os.environ.get("AODP_SERVERS") or ",".join(config.get("servers") or ["west"])).split(",") if s.strip()]
+    servers = [s for s in servers if s in AODP_HOSTS] or ["west"]
+    retention = int(os.environ.get("HISTORY_RETENTION_DAYS") or config.get("history_retention_days") or 30)
     ids = sorted(r["id"] for r in db.select_all(
         "tracked_items", {"select": "id", "active": "eq.true"}
     ))
@@ -278,11 +283,23 @@ def main():
         ids = ids[:limit]
     if not ids:
         raise SystemExit("tracked_items está vacía. Corré seed_items.py primero.")
-    log(f"{len(ids)} IDs a consultar en {host}")
+    log(f"{len(ids)} IDs · servidores: {', '.join(servers)}")
+    failed = []
+    for server in servers:
+        try:
+            collect(db, ids, server, AODP_HOSTS[server], retention, dry_run)
+        except Exception as exc:
+            log(f"ERROR en {server}: {exc}")
+            failed.append(server)
+    if failed:
+        raise SystemExit(f"Fallaron: {', '.join(failed)}")
 
+
+def collect(db, ids, server, host, retention, dry_run):
+    log(f"=== Servidor {server} ({host}) ===")
     run = None
     if not dry_run:
-        run = db.insert_returning("collector_runs", {"ids_requested": len(ids)})
+        run = db.insert_returning("collector_runs", {"ids_requested": len(ids), "server": server})
 
     try:
         session = requests.Session()
@@ -298,7 +315,7 @@ def main():
             os.environ.get("FULL_HISTORY") == "1"
             or datetime.now(timezone.utc).hour < 2
             or dry_run
-            or not db.has_rows("market_history")
+            or not db.has_rows("market_history", {"server": f"eq.{server}"})
         )
         upsert_since = since if full else date.today() - timedelta(days=3)
         log("Historial: " + ("completo" if full else "últimos 3 días"))
@@ -310,7 +327,7 @@ def main():
             batch = ids[n:n + AODP_BATCH]
             data = aodp_get(session, f"{host}/prices/{','.join(batch)}.json",
                             {"locations": ",".join(LOCATIONS), "qualities": 1})
-            prices.extend(price_rows(data, fetched_at))
+            prices.extend(price_rows(data, fetched_at, server))
             if i % 10 == 0:
                 log(f"  {min(n + AODP_BATCH, len(ids))}/{len(ids)}")
             time.sleep(AODP_PAUSE)
@@ -320,7 +337,7 @@ def main():
             batch = ids[n:n + AODP_BATCH]
             data = aodp_get(session, f"{host}/history/{','.join(batch)}.json",
                             {"locations": ",".join(LOCATIONS), "time-scale": 24})
-            history.extend(history_rows(data, upsert_since))
+            history.extend(history_rows(data, upsert_since, server))
             if i % 10 == 0:
                 log(f"  {min(n + AODP_BATCH, len(ids))}/{len(ids)}")
             time.sleep(AODP_PAUSE)
@@ -331,9 +348,9 @@ def main():
             return
 
         log("Guardando en Supabase...")
-        db.upsert("market_prices", prices, "item_id,city")
-        db.upsert("market_history", history, "item_id,city,day")
-        db.delete("market_history", {"day": f"lt.{since.isoformat()}"})
+        db.upsert("market_prices", prices, "server,item_id,city,quality")
+        db.upsert("market_history", history, "server,item_id,city,quality,day")
+        db.delete("market_history", {"server": f"eq.{server}", "day": f"lt.{since.isoformat()}"})
 
         db.update("collector_runs", {"id": run["id"]}, {
             "finished_at": datetime.now(timezone.utc).isoformat(),
